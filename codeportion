@@ -1,0 +1,195 @@
+#include <iostream>
+#include <vector>
+#include <cmath>
+#include <tuple>
+#include <fstream>
+#include <iomanip>
+
+const double PI = 3.14159265358979323846;
+const double RAD_TO_DEG = 180.0 / PI; // Constant to convert radians to degrees
+const double KNOTS_TO_FEET_PER_SEC = 1.68781;  // Factor for converting velocity from knots to feet per second
+
+// Function to calculate angular rates p, q, r
+std::tuple<double, double, double> computeAngularRates(double time) 
+{
+    double p = (30 * PI) / 6;  // Constant roll rate in degrees/second
+    double q = std::cos((6.0 / PI) * time);  // Angular rate q
+    double r = 3 * std::sin((30.0 / PI) * time);  // Angular rate r
+    return std::make_tuple(p, q, r);
+}
+
+// Gimbal equation to determine the change in Euler angles
+std::vector<double> calculateGimbalEquation(double phi, double theta, double p, double q, double r) 
+{
+    std::vector<double> eulerRate(3);
+    eulerRate[0] = std::tan(theta) * std::sin(phi) * p + std::tan(theta) * std::cos(phi) * r;  // Rate of change of phi
+    eulerRate[1] = std::cos(phi) * q - std::sin(phi) * r;                            // Rate of change of theta
+    eulerRate[2] = std::sin(phi) / std::cos(theta) * q + std::cos(phi) / std::cos(theta) * r;  // Rate of change of psi
+    return eulerRate;
+}
+
+// Generate skew-symmetric matrix for angular rates [p, q, r]
+std::vector<std::vector<double>> createSkewSymmetricMatrix(double p, double q, double r) 
+{
+    return 
+    {
+        {0, -r, q},
+        {r, 0, -p},
+        {-q, p, 0}
+    };
+}
+
+// Multiply two 3x3 matrices
+std::vector<std::vector<double>> multiplyMatrices(const std::vector<std::vector<double>>& A, const std::vector<std::vector<double>>& B) 
+{
+    std::vector<std::vector<double>> result(3, std::vector<double>(3, 0.0));
+    for (int i = 0; i < 3; ++i) 
+    {
+        for (int j = 0; j < 3; ++j) 
+        {
+            for (int k = 0; k < 3; ++k) 
+            {
+                result[i][j] += A[i][k] * B[k][j];
+            }
+        }
+    }
+    return result;
+}
+
+// Normalize the DCM to preserve orthonormal properties
+std::vector<std::vector<double>> normalizeDirectionCosineMatrix(const std::vector<std::vector<double>>& dcm) 
+{
+    std::vector<std::vector<double>> normalizedDCM = dcm;
+    for (int i = 0; i < 3; ++i) 
+    {
+        double norm = std::sqrt(normalizedDCM[i][0] * normalizedDCM[i][0] +
+                                normalizedDCM[i][1] * normalizedDCM[i][1] +
+                                normalizedDCM[i][2] * normalizedDCM[i][2]);
+        for (int j = 0; j < 3; ++j) 
+        {
+            normalizedDCM[i][j] /= norm;
+        }
+    }
+    return normalizedDCM;
+}
+
+// Update DCM using the strapdown equation
+std::vector<std::vector<double>> updateDirectionCosineMatrix(const std::vector<std::vector<double>>& dcm, double p, double q, double r, double deltaTime) 
+{
+    auto skewMatrix = createSkewSymmetricMatrix(p, q, r);
+    auto dcmRate = multiplyMatrices(dcm, skewMatrix);  // C_dot = DCM * skewMatrix
+    // Euler integration: C_new = C_old + C_dot * deltaTime
+    std::vector<std::vector<double>> newDCM(3, std::vector<double>(3, 0.0));
+    for (int i = 0; i < 3; ++i) {
+        for (int j = 0; j < 3; ++j) {
+            newDCM[i][j] = dcm[i][j] + dcmRate[i][j] * deltaTime;
+        }
+    }
+
+    // Normalize the updated DCM
+    return normalizeDirectionCosineMatrix(newDCM);
+}
+
+// Runge-Kutta 4th Order step for Euler angles
+std::vector<double> performRK4Step(double phi, double theta, double psi, double p, double q, double r, double deltaTime) 
+{
+    auto k1 = calculateGimbalEquation(phi, theta, p, q, r);
+
+    auto k2_phi = phi + 0.5 * k1[0] * deltaTime;
+    auto k2_theta = theta + 0.5 * k1[1] * deltaTime;
+    auto k2_psi = psi + 0.5 * k1[2] * deltaTime;
+    auto k2 = calculateGimbalEquation(k2_phi, k2_theta, p, q, r);
+
+    auto k3_phi = phi + 0.5 * k2[0] * deltaTime;
+    auto k3_theta = theta + 0.5 * k2[1] * deltaTime;
+    auto k3_psi = psi + 0.5 * k2[2] * deltaTime;
+    auto k3 = calculateGimbalEquation(k3_phi, k3_theta, p, q, r);
+
+    auto k4_phi = phi + k3[0] * deltaTime;
+    auto k4_theta = theta + k3[1] * deltaTime;
+    auto k4_psi = psi + k3[2] * deltaTime;
+    auto k4 = calculateGimbalEquation(k4_phi, k4_theta, p, q, r);
+
+    std::vector<double> eulerRateDot(3);
+    eulerRateDot[0] = (k1[0] + 2 * k2[0] + 2 * k3[0] + k4[0]) / 6.0;  // Rate of change of phi
+    eulerRateDot[1] = (k1[1] + 2 * k2[1] + 2 * k3[1] + k4[1]) / 6.0;  // Rate of change of theta
+    eulerRateDot[2] = (k1[2] + 2 * k2[2] + 2 * k3[2] + k4[2]) / 6.0;  // Rate of change of psi
+
+    return eulerRateDot;
+}
+
+// Main function to execute simulation and save results to file
+void executeSimulationAndSaveResults(double deltaTime, const std::string& outputFilename) 
+{
+    // Time settings and initial state
+    double totalTime = 60; // Total simulation time in seconds
+    int totalSteps = static_cast<int>(totalTime / deltaTime);
+
+    // Initial state vectors
+    std::vector<double> eulerAngles = {0, 0, 0};  // Initial Euler angles [phi, theta, psi]
+    std::vector<double> bodyVelocity = {60 * KNOTS_TO_FEET_PER_SEC, 0, 0};  // Initial velocity in body frame (ft/sec)
+    std::vector<double> positionNED = {0, 0, 0};  // Initial position in NED
+    std::vector<std::vector<double>> directionCosineMatrix = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};  // Identity matrix for initial DCM
+
+    // Output file setup
+    std::ofstream outputFile(outputFilename);
+    outputFile << "Time,phi,theta,psi,p,q,r,phi_dot,theta_dot,psi_dot,V_NED_x,V_NED_y,V_NED_z,Pos_NED_x,Pos_NED_y,Pos_NED_z\n";
+
+    for (int step = 0; step < totalSteps; ++step) 
+    {
+        double currentTime = step * deltaTime;
+
+        // Compute angular velocities [p, q, r]
+        auto [p, q, r] = computeAngularRates(currentTime);
+
+        // Update the DCM based on current angular rates
+        directionCosineMatrix = updateDirectionCosineMatrix(directionCosineMatrix, p, q, r, deltaTime);
+
+        // Convert velocity to NED frame
+        std::vector<double> velocityNED(3, 0.0);
+        for (int i = 0; i < 3; ++i) 
+        {
+            velocityNED[i] = directionCosineMatrix[i][0] * bodyVelocity[0] + directionCosineMatrix[i][1] * bodyVelocity[1] + directionCosineMatrix[i][2] * bodyVelocity[2];
+        }
+
+        // Update position in NED frame
+        for (int i = 0; i < 3; ++i) 
+        {
+            positionNED[i] += velocityNED[i] * deltaTime;
+        }
+
+        // Retrieve current Euler angles
+        auto phi = eulerAngles[0], theta = eulerAngles[1], psi = eulerAngles[2];
+
+        // Update Euler angles using RK4 integration
+        auto eulerRates = performRK4Step(phi, theta, psi, p, q, r, deltaTime);
+
+        // Update the Euler angles for the next iteration
+        eulerAngles[0] += eulerRates[0] * deltaTime;  // phi
+        eulerAngles[1] += eulerRates[1] * deltaTime;  // theta
+        eulerAngles[2] += eulerRates[2] * deltaTime;  // psi
+
+        // Write the current state to the output file
+        outputFile << std::fixed << std::setprecision(6)
+                   << currentTime << "," << eulerAngles[0] * RAD_TO_DEG << "," << eulerAngles[1] * RAD_TO_DEG << "," << eulerAngles[2] * RAD_TO_DEG << "," 
+                   << p * RAD_TO_DEG << "," << q * RAD_TO_DEG << "," << r * RAD_TO_DEG << ","
+                   << eulerRates[0] * RAD_TO_DEG << "," << eulerRates[1] * RAD_TO_DEG << "," << eulerRates[2] * RAD_TO_DEG << ","
+                   << velocityNED[0] << "," << velocityNED[1] << "," << velocityNED[2] << ","
+                   << positionNED[0] << "," << positionNED[1] << "," << positionNED[2] << "\n";
+    }
+
+    outputFile.close(); // Close the file after writing
+}
+
+int main() 
+{
+    // Test different time step sizes
+    std::vector<double> timeStepSizes = {0.2, 0.1, 0.025, 0.0125}; // Smaller dt leads to better accuracy
+    for (const auto& dt : timeStepSizes) 
+    {
+        std::string filename = "simulation_output_dt_" + std::to_string(dt) + ".csv"; // Generate unique output filenames
+        executeSimulationAndSaveResults(dt, filename);
+    }
+
+    return 0;
+}
